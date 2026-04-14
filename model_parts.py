@@ -1,447 +1,323 @@
-import json
-import math
-import os
-from dataclasses import dataclass
+# model_parts.py
+
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 import torch.nn.functional as F
+from typing import Optional, Tuple
+from config_model import ModelConfig
 
 
-class GroupedQueryAttentionWithRoPE(nn.Module):
-    """
-    Grouped Query Attention (GQA) with Rotary Position Embeddings (RoPE).
+# ──────────────────────────────────────────────────────────────────────────────
+# KV Cache
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Dimension legend (used throughout):
-        b          = batch size
-        T          = sequence length (num_tokens)
-        d_in       = input feature dim
-        d_out      = output feature dim  (= num_heads * head_dim)
-        H          = num_heads  (query heads)
-        Hkv        = num_kv_heads
-        G          = num_groups = H // Hkv
-        D          = head_dim   = d_out // H
-    """
-
+class LayerKVCache:
     def __init__(
         self,
-        d_in,
-        d_out,
-        context_length,
-        dropout,
-        num_heads,
-        num_kv_heads=None,
-        qkv_bias=False,
-        use_rope=True,
-        window_size=None,
-        use_attention_bias=True,
+        batch_size:   int,
+        num_kv_heads: int,
+        max_seq_len:  int,
+        head_dim:     int,
+        device:       torch.device,
+        dtype:        torch.dtype = torch.float32,
     ):
+        self.max_seq_len  = max_seq_len
+        self.seq_len: int = 0
+
+        self.k_cache = torch.zeros(
+            batch_size, num_kv_heads, max_seq_len, head_dim,
+            device=device, dtype=dtype,
+        )
+        self.v_cache = torch.zeros(
+            batch_size, num_kv_heads, max_seq_len, head_dim,
+            device=device, dtype=dtype,
+        )
+
+    def update(
+        self,
+        new_k: torch.Tensor,
+        new_v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        T_new = new_k.shape[2]
+        end   = self.seq_len + T_new
+        if end > self.max_seq_len:
+            raise ValueError(
+                f"KV cache overflow: position {end - 1} >= max_seq_len {self.max_seq_len}. "
+                "Call reset() between requests or increase max_seq_len."
+            )
+        self.k_cache[:, :, self.seq_len:end] = new_k
+        self.v_cache[:, :, self.seq_len:end] = new_v
+        self.seq_len = end
+        return self.k_cache[:, :, :end], self.v_cache[:, :, :end]
+
+    def reset(self) -> None:
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+        self.seq_len = 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Grouped Query Attention + RoPE  (KV-cache compatible)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GroupedQueryAttentionWithRoPE(nn.Module):
+
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
+        assert cfg.d_model % cfg.num_heads      == 0, "d_model must be divisible by num_heads"
+        assert cfg.num_heads % cfg.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
 
-        self.num_heads    = num_heads                                          # H
-        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads  # Hkv
-        assert num_heads % self.num_kv_heads == 0, \
-            "num_heads must be divisible by num_kv_heads"
+        self.num_heads    = cfg.num_heads
+        self.num_kv_heads = cfg.num_kv_heads
+        self.num_groups   = cfg.num_heads // cfg.num_kv_heads
+        self.head_dim     = cfg.d_model // cfg.num_heads
+        self.d_out        = cfg.d_model
+        self.use_rope     = cfg.use_rope
+        self.use_attn_bias = cfg.use_attention_bias
 
-        self.num_groups       = num_heads // self.num_kv_heads                 # G
-        self.head_dim         = d_out // num_heads                             # D
-        self.d_out            = d_out
-        self.use_rope         = use_rope
-        self.window_size      = window_size
-        self.use_attention_bias = use_attention_bias
+        self.W_q      = nn.Linear(cfg.d_model, cfg.d_model,                       bias=cfg.qkv_bias)
+        self.W_k      = nn.Linear(cfg.d_model, cfg.num_kv_heads * self.head_dim,  bias=cfg.qkv_bias)
+        self.W_v      = nn.Linear(cfg.d_model, cfg.num_kv_heads * self.head_dim,  bias=cfg.qkv_bias)
+        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
+        self.dropout  = nn.Dropout(cfg.dropout)
 
-        # Q projects to (H * D), K/V project to (Hkv * D)
-        self.W_q = nn.Linear(d_in, d_out,                          bias=qkv_bias)
-        self.W_k = nn.Linear(d_in, self.num_kv_heads * self.head_dim, bias=qkv_bias)
-        self.W_v = nn.Linear(d_in, self.num_kv_heads * self.head_dim, bias=qkv_bias)
-        self.out_proj = nn.Linear(d_out, d_out)
-        self.dropout  = nn.Dropout(dropout)
-
-        # Learnable additive bias (applied after scaling, before masking)
-        if use_attention_bias:
-            # shape: (1, H, context_length, context_length)
+        if cfg.use_attention_bias:
             self.attention_bias = nn.Parameter(
-                torch.zeros(1, self.num_heads, context_length, context_length)
+                torch.zeros(1, cfg.num_heads, cfg.max_seq_len, cfg.max_seq_len)
             )
 
-        if use_rope:
-            # cos/sin: (context_length, D)
-            cos, sin = self._precompute_rope_cos_sin(context_length, self.head_dim)
-            self.register_buffer("cos_cached", cos)
+        if cfg.use_rope:
+            # FIX: precompute for head_dim, NOT head_dim//2.
+            # _precompute_rope returns cos/sin of shape (max_seq_len, head_dim).
+            cos, sin = self._precompute_rope(cfg.max_seq_len, self.head_dim)
+            self.register_buffer("cos_cached", cos)   # (max_seq_len, head_dim)
             self.register_buffer("sin_cached", sin)
 
-    # ------------------------------------------------------------------
-    # RoPE helpers
-    # ------------------------------------------------------------------
+    # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _precompute_rope_cos_sin(self, seq_len, dim, theta=10000.0):
+    @staticmethod
+    def _precompute_rope(seq_len: int, dim: int, theta: float = 10_000.0):
         """
-        Returns cos, sin each of shape (seq_len, dim).
-        The full embedding is [freqs, freqs] so it covers all of dim.
+        Returns cos/sin tables of shape (seq_len, dim).
+        inv_freq has dim//2 entries; we cat(freqs, freqs) to fill all dim slots
+        so that the rotate-half trick works without any re-chunking.
         """
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        # inv_freq: (dim//2,)
-        t = torch.arange(seq_len, device=inv_freq.device).float()
-        # t: (seq_len,)
-        freqs = torch.outer(t, inv_freq)       # (seq_len, dim//2)
-        emb   = torch.cat((freqs, freqs), dim=-1)  # (seq_len, dim)
-        return emb.cos(), emb.sin()            # each (seq_len, dim)
+        assert dim % 2 == 0, "head_dim must be even for RoPE"
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))  # (dim//2,)
+        t        = torch.arange(seq_len).float()                               # (seq_len,)
+        freqs    = torch.outer(t, inv_freq)                                    # (seq_len, dim//2)
+        emb      = torch.cat((freqs, freqs), dim=-1)                           # (seq_len, dim)
+        return emb.cos(), emb.sin()
 
-    def _apply_rotary_emb(self, x, cos, sin):
+    @staticmethod
+    def _apply_rotary_emb(
+        x:   torch.Tensor,   # (b, H, T, D)
+        cos: torch.Tensor,   # (1, 1, T, D)  — already sliced & reshaped by caller
+        sin: torch.Tensor,   # (1, 1, T, D)
+    ) -> torch.Tensor:
         """
-        Apply RoPE in-place style.
-
-        Args:
-            x:   (b, num_heads, T, D)   — query or key tensor
-            cos: (1, 1, T, D)           — pre-sliced & pre-shaped by caller
-            sin: (1, 1, T, D)
-
-        Returns:
-            rotated tensor, same shape as x
+        Rotate-half RoPE.  cos/sin are already (1,1,T,D) — no re-chunking needed.
+        x is split into first-half / second-half along head_dim.
         """
-        # Split along the LAST dimension into two halves of size D//2
-        # x1, x2: (b, num_heads, T, D//2)
-        x1, x2 = x.chunk(2, dim=-1)
+        D = x.shape[-1]
+        half = D // 2
+        # FIX: split on head_dim directly — no .chunk() on cos/sin
+        x1 = x[..., :half]    # (b, H, T, D//2)
+        x2 = x[..., half:]    # (b, H, T, D//2)
+        c  = cos[..., :half]   # (1, 1, T, D//2)
+        s  = sin[..., :half]   # (1, 1, T, D//2)
+        return torch.cat([x1 * c - x2 * s,
+                          x2 * c + x1 * s], dim=-1)
 
-        # cos/sin are (1, 1, T, D), but we only need the first D//2 entries
-        # because emb = [freqs, freqs], both halves are identical
-        # So cos[..., :D//2] and sin[..., :D//2] are what we want.
-        # Alternatively, chunk them the same way:
-        cos1, _ = cos.chunk(2, dim=-1)   # (1, 1, T, D//2)
-        sin1, _ = sin.chunk(2, dim=-1)   # (1, 1, T, D//2)
-
-        o1 = x1 * cos1 - x2 * sin1      # (b, H, T, D//2)
-        o2 = x2 * cos1 + x1 * sin1      # (b, H, T, D//2)
-        return torch.cat((o1, o2), dim=-1)  # (b, H, T, D)
-
-    # ------------------------------------------------------------------
-    # GQA helper
-    # ------------------------------------------------------------------
-
-    def _repeat_kv(self, kv, num_repeats):
-        """
-        Expand KV heads to match the number of query heads.
-
-        Args:
-            kv:          (b, Hkv, T, D)
-            num_repeats: G  (= H // Hkv)
-
-        Returns:
-            (b, H, T, D)
-        """
-        if num_repeats == 1:
+    def _repeat_kv(self, kv: torch.Tensor) -> torch.Tensor:
+        """Expand (b, Hkv, S, D) → (b, H, S, D)."""
+        if self.num_groups == 1:
             return kv
-        b, hkv, T, D = kv.shape
-        kv = kv[:, :, None, :, :]                         # (b, Hkv, 1, T, D)
-        kv = kv.expand(b, hkv, num_repeats, T, D)         # (b, Hkv, G, T, D)
-        return kv.reshape(b, hkv * num_repeats, T, D)     # (b, H, T, D)
+        b, hkv, S, D = kv.shape
+        kv = kv[:, :, None, :, :].expand(b, hkv, self.num_groups, S, D)
+        return kv.reshape(b, hkv * self.num_groups, S, D)
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    # ── forward ───────────────────────────────────────────────────────────────
 
-    def forward(self, x):
-        """
-        Args:
-            x: (b, T, d_in)
+    def forward(
+        self,
+        x:        torch.Tensor,              # (b, T, d_model)
+        kv_cache: Optional[LayerKVCache] = None,
+    ) -> torch.Tensor:
 
-        Returns:
-            (b, T, d_out)
-        """
-        b, T, d_in = x.shape
+        b, T, _ = x.shape
 
-        # ── Projections ──────────────────────────────────────────────
-        # Q: (b, T, d_out)  →  (b, H, T, D)
-        queries = self.W_q(x).view(b, T, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.W_q(x).view(b, T, self.num_heads,    self.head_dim).transpose(1, 2)
+        k = self.W_k(x).view(b, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.W_v(x).view(b, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        # K: (b, T, Hkv*D)  →  (b, Hkv, T, D)
-        keys    = self.W_k(x).view(b, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        # V: (b, T, Hkv*D)  →  (b, Hkv, T, D)
-        values  = self.W_v(x).view(b, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        # ── RoPE ─────────────────────────────────────────────────────
         if self.use_rope:
-            # Slice to current sequence length, then unsqueeze for broadcasting
-            # cos_cached: (context_length, D) → slice → (T, D) → (1, 1, T, D)
-            cos = self.cos_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, D)
-            sin = self.sin_cached[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, D)
+            offset = kv_cache.seq_len if kv_cache is not None else 0
 
-            # _apply_rotary_emb expects cos/sin as (1, 1, T, D) — no further unsqueeze inside
-            queries = self._apply_rotary_emb(queries, cos, sin)  # (b, H,   T, D)
-            keys    = self._apply_rotary_emb(keys,    cos, sin)  # (b, Hkv, T, D)
+            # FIX: guard against offset + T exceeding precomputed table
+            max_pos = self.cos_cached.shape[0]
+            if offset + T > max_pos:
+                raise ValueError(
+                    f"RoPE table overflow: offset ({offset}) + T ({T}) = {offset + T} "
+                    f"> max_seq_len ({max_pos}). Increase context_length in ModelConfig."
+                )
 
-        # ── GQA: repeat KV heads ─────────────────────────────────────
-        keys   = self._repeat_kv(keys,   self.num_groups)  # (b, H, T, D)
-        values = self._repeat_kv(values, self.num_groups)  # (b, H, T, D)
+            # Slice exact T positions, then reshape for broadcasting
+            cos = self.cos_cached[offset:offset + T]            # (T, D)
+            sin = self.sin_cached[offset:offset + T]            # (T, D)
+            cos = cos.unsqueeze(0).unsqueeze(0)                  # (1, 1, T, D)
+            sin = sin.unsqueeze(0).unsqueeze(0)                  # (1, 1, T, D)
 
-        # ── Attention scores ─────────────────────────────────────────
-        # (b, H, T, D) @ (b, H, D, T) → (b, H, T, T)
-        attn = torch.matmul(queries, keys.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            q = self._apply_rotary_emb(q, cos, sin)
+            k = self._apply_rotary_emb(k, cos, sin)
 
-        # Learnable bias (added after scaling)
-        if self.use_attention_bias:
-            attn = attn + self.attention_bias[:, :, :T, :T]  # (1, H, T, T) broadcast
+        if kv_cache is not None:
+            k_full, v_full = kv_cache.update(k, v)
+        else:
+            k_full, v_full = k, v
 
-        # Causal mask: mask out future positions with -inf
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
-        )
-        attn = attn.masked_fill(causal_mask, float("-inf"))  # (b, H, T, T)
+        S = k_full.shape[2]
+
+        k_full = self._repeat_kv(k_full)
+        v_full = self._repeat_kv(v_full)
+
+        # (b, H, T, D) × (b, H, D, S) → (b, H, T, S)
+        attn = torch.matmul(q, k_full.transpose(-2, -1)) / (self.head_dim ** 0.5)
+
+        if self.use_attn_bias:
+            row_start = S - T
+            attn = attn + self.attention_bias[:, :, row_start:row_start + T, :S]
+
+        if kv_cache is None:
+            causal = torch.triu(
+                torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+            )
+            attn = attn.masked_fill(causal, float("-inf"))
 
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
-        # ── Context ──────────────────────────────────────────────────
-        # (b, H, T, T) @ (b, H, T, D) → (b, H, T, D)
-        context = torch.matmul(attn, values)
-
-        # (b, H, T, D) → (b, T, H*D) = (b, T, d_out)
-        context = context.transpose(1, 2).contiguous().view(b, T, self.d_out)
-
-        return self.out_proj(context)  # (b, T, d_out)
+        ctx = torch.matmul(attn, v_full)                         # (b, H, T, D)
+        ctx = ctx.transpose(1, 2).contiguous().view(b, T, self.d_out)
+        return self.out_proj(ctx)
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import Optional
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────
-
-@dataclass
-class MoEConfig:
-    d_model:        int   = 512    # token embedding dim
-    d_ff:           int   = 2048   # each expert's inner dim
-    num_experts:    int   = 8      # E
-    top_k:          int   = 2      # k  (active experts per token)
-    dropout:        float = 0.1
-    # Load-balancing loss coefficient (α in Switch Transformer paper §2.2)
-    aux_loss_coef:  float = 1e-2
-    # Capacity factor C: expert buffer = C * (T / E) tokens.
-    # Used only during training; set None to skip capacity limiting.
-    capacity_factor: Optional[float] = 1.25
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Expert: a single FFN  (identical in structure to a standard FFN block)
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Expert
+# ──────────────────────────────────────────────────────────────────────────────
 
 class Expert(nn.Module):
-    """
-    One expert FFN.
-
-    Dimensions:
-        input/output : (tokens_for_this_expert, d_model)
-        hidden       : (tokens_for_this_expert, d_ff)
-    """
-
-    def __init__(self, d_model: int, d_ff: int, dropout: float):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.fc1  = nn.Linear(d_model, d_ff)
-        self.fc2  = nn.Linear(d_ff, d_model)
-        self.drop = nn.Dropout(dropout)
+        self.fc1  = nn.Linear(cfg.d_model, cfg.d_ff)
+        self.fc2  = nn.Linear(cfg.d_ff,    cfg.d_model)
+        self.drop = nn.Dropout(cfg.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (n_tokens, d_model)
         return self.fc2(self.drop(F.gelu(self.fc1(x))))
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Router
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 class TopKRouter(nn.Module):
-    """
-    Linear router: projects each token to E logits, picks top-k experts.
-
-    Reference: Shazeer et al. 2017 §2, Switch Transformer §2.1
-
-    Forward returns:
-        gate_weights : (b*T, k)   softmax-normalised weights for selected experts
-        expert_idx   : (b*T, k)   indices of selected experts
-        router_probs : (b*T, E)   full softmax distribution (for aux loss)
-    """
-
-    def __init__(self, d_model: int, num_experts: int, top_k: int):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.num_experts = num_experts
-        self.top_k       = top_k
-        self.W_r = nn.Linear(d_model, num_experts, bias=False)
+        self.num_experts = cfg.num_experts
+        self.top_k       = cfg.top_k
+        self.W_r = nn.Linear(cfg.d_model, cfg.num_experts, bias=False)
 
     def forward(self, x: torch.Tensor):
-        # x: (N, d_model)  where N = b*T (flattened batch×seq)
-        logits      = self.W_r(x)                           # (N, E)
-        router_probs = F.softmax(logits, dim=-1)             # (N, E)
-
-        # top-k selection
+        router_probs = F.softmax(self.W_r(x), dim=-1)            # (N, E)
         gate_weights, expert_idx = torch.topk(router_probs, self.top_k, dim=-1)
-        # gate_weights: (N, k) — re-normalise so selected weights sum to 1
         gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True)
-
         return gate_weights, expert_idx, router_probs
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Load-balancing auxiliary loss
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Load-balance auxiliary loss
+# ──────────────────────────────────────────────────────────────────────────────
 
-def load_balance_loss(router_probs: torch.Tensor,
-                      expert_idx:   torch.Tensor,
-                      num_experts:  int) -> torch.Tensor:
-    """
-    Switch Transformer auxiliary loss (§2.2):
-
-        L_aux = α · E · Σ_i  f_i · P_i
-
-    where
-        f_i = fraction of tokens routed to expert i
-        P_i = mean router probability assigned to expert i
-
-    Both are (E,) vectors; their dot product measures imbalance.
-    Minimising L_aux encourages uniform expert utilisation.
-
-    Args:
-        router_probs : (N, E)  full softmax over all experts
-        expert_idx   : (N, k)  selected expert indices per token
-        num_experts  : E
-
-    Returns:
-        scalar loss
-    """
-    N = router_probs.size(0)
-
-    # f_i: fraction of tokens that chose expert i (any of the k slots)
-    # one-hot over E for every (token, slot) pair → sum over slots → mean over tokens
-    one_hot = F.one_hot(expert_idx, num_classes=num_experts).float()  # (N, k, E)
-    # token routed to expert i if it appears in ANY of the k slots
-    token_mask = one_hot.sum(dim=1).clamp(max=1.0)                     # (N, E)  binary
-    f = token_mask.mean(dim=0)                                          # (E,)
-
-    # P_i: mean router probability for expert i across all tokens
-    P = router_probs.mean(dim=0)                                        # (E,)
-
+def load_balance_loss(
+    router_probs: torch.Tensor,
+    expert_idx:   torch.Tensor,
+    num_experts:  int,
+) -> torch.Tensor:
+    one_hot    = F.one_hot(expert_idx, num_classes=num_experts).float()
+    token_mask = one_hot.sum(dim=1).clamp(max=1.0)
+    f = token_mask.mean(dim=0)
+    P = router_probs.mean(dim=0)
     return num_experts * (f * P).sum()
 
 
-# ──────────────────────────────────────────────────────────────────────
-# MoE FFN layer  (drop-in replacement for a standard FFN)
-# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# MoE FFN layer
+# ──────────────────────────────────────────────────────────────────────────────
 
 class MoELayer(nn.Module):
-    """
-    Mixture-of-Experts FFN layer.
-
-    Replaces a standard FFN inside a Transformer block.
-    Each token is independently routed to top-k experts;
-    their outputs are combined via a weighted sum.
-
-    Data flow (N = b*T tokens):
-        x (b, T, d_model)
-          → flatten → (N, d_model)
-          → router  → gate_weights (N, k), expert_idx (N, k)
-          → per-expert FFN on dispatched tokens
-          → accumulate weighted outputs
-          → unflatten → (b, T, d_model)
-
-    Capacity limiting (training):
-        Each expert processes at most ⌊C · N / E⌋ tokens.
-        Tokens that overflow an expert are dropped (their contribution
-        is zeroed). C=1.25 is the Switch Transformer default.
-
-    Returns:
-        output   : (b, T, d_model)
-        aux_loss : scalar — add α * aux_loss to your total training loss
-    """
-
-    def __init__(self, cfg: MoEConfig):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.cfg        = cfg
-        self.router     = TopKRouter(cfg.d_model, cfg.num_experts, cfg.top_k)
-        self.experts    = nn.ModuleList([
-            Expert(cfg.d_model, cfg.d_ff, cfg.dropout)
-            for _ in range(cfg.num_experts)
-        ])
+        self.cfg     = cfg
+        self.router  = TopKRouter(cfg)
+        self.experts = nn.ModuleList([Expert(cfg) for _ in range(cfg.num_experts)])
 
-    def forward(self, x: torch.Tensor):
-        """
-        Args:
-            x : (b, T, d_model)
-
-        Returns:
-            out      : (b, T, d_model)
-            aux_loss : scalar tensor
-        """
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, T, d = x.shape
         N = b * T
+        x_flat = x.view(N, d)
 
-        # ── Flatten ───────────────────────────────────────────────────
-        x_flat = x.view(N, d)                          # (N, d_model)
-
-        # ── Route ─────────────────────────────────────────────────────
-        # gate_weights : (N, k)   re-normalised top-k probabilities
-        # expert_idx   : (N, k)   which experts to call
-        # router_probs : (N, E)   full distribution (for aux loss)
         gate_weights, expert_idx, router_probs = self.router(x_flat)
 
-        # ── Aux loss ──────────────────────────────────────────────────
         aux_loss = self.cfg.aux_loss_coef * load_balance_loss(
             router_probs, expert_idx, self.cfg.num_experts
         )
 
-        # ── Expert capacity ───────────────────────────────────────────
-        # capacity: maximum tokens an expert will accept this forward pass
-        if self.cfg.capacity_factor is not None and self.training:
-            capacity = int(self.cfg.capacity_factor * N / self.cfg.num_experts)
-            capacity = max(capacity, 1)
-        else:
-            capacity = N   # no limit at inference
+        capacity = (
+            max(int(self.cfg.capacity_factor * N / self.cfg.num_experts), 1)
+            if (self.cfg.capacity_factor is not None and self.training)
+            else N
+        )
 
-        # ── Dispatch & combine ────────────────────────────────────────
-        # Output accumulator: start at zero, add each expert's contribution
-        out_flat = torch.zeros_like(x_flat)            # (N, d_model)
-
+        out_flat = torch.zeros_like(x_flat)
         for expert_id, expert in enumerate(self.experts):
-            # Find all (token, slot) pairs assigned to this expert
-            # expert_idx: (N, k)  — check all k slots
             token_mask, slot_idx = torch.where(expert_idx == expert_id)
-            # token_mask : 1-D indices into [0..N) of tokens routed here
-            # slot_idx   : which of the k slots matched (needed to read gate weight)
-
             if token_mask.numel() == 0:
-                continue   # expert unused this batch
-
-            # Apply capacity: truncate if over budget
+                continue
             if token_mask.numel() > capacity:
                 token_mask = token_mask[:capacity]
                 slot_idx   = slot_idx[:capacity]
+            w          = gate_weights[token_mask, slot_idx]
+            expert_out = expert(x_flat[token_mask])
+            out_flat.index_add_(0, token_mask, expert_out * w.unsqueeze(-1))
 
-            # Gather the tokens assigned to this expert
-            expert_input  = x_flat[token_mask]         # (n_e, d_model)
-
-            # Run the expert FFN
-            expert_output = expert(expert_input)        # (n_e, d_model)
-
-            # Retrieve gate weights for this expert/slot combination
-            w = gate_weights[token_mask, slot_idx]      # (n_e,)
-
-            # Weighted accumulate back into output (scatter-add)
-            out_flat.index_add_(
-                0,
-                token_mask,
-                expert_output * w.unsqueeze(-1)         # (n_e, d_model)
-            )
-
-        # ── Unflatten ─────────────────────────────────────────────────
-        out = out_flat.view(b, T, d)                    # (b, T, d_model)
-
-        return out, aux_loss
+        return out_flat.view(b, T, d), aux_loss
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Transformer block
+# ──────────────────────────────────────────────────────────────────────────────
 
+class Transformer(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(cfg.d_model)
+        self.gqa   = GroupedQueryAttentionWithRoPE(cfg)
+        self.norm2 = nn.RMSNorm(cfg.d_model)
+        self.moe   = MoELayer(cfg)
 
+    def forward(
+        self,
+        x:        torch.Tensor,
+        kv_cache: Optional[LayerKVCache] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        residual = x
+        x = self.gqa(self.norm1(x), kv_cache=kv_cache)
+        x = residual + x
+
+        residual = x
+        moe_out, aux_loss = self.moe(self.norm2(x))
+        x = residual + moe_out
+
+        return x, aux_loss
