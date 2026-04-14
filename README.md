@@ -1,7 +1,8 @@
 # gptoss
 
 An open-source, from-scratch implementation of a modern Decoder-Only Transformer (Large Language Model) in PyTorch. Designed for learning and experimentation, `gptoss` incorporates many of the advanced architectural features found in state-of-the-art LLMs today.
-
+## Architechture Diagram
+![gptoss Diagram](public/Gemini_Generated_Image_opyjsjopyjsjopyj.png)
 ## 🚀 Key Features
 
 *   **Sparse Mixture-of-Experts (MoE) FFN**: Scalable model capacity using 32 experts with top-2 routing and an auxiliary load-balancing loss.
