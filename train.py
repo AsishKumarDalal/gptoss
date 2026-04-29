@@ -12,15 +12,17 @@ Quick start
 
 Graphs
 ------
-Every time a checkpoint is saved, four PNG plots are written to:
+Every time a checkpoint is saved, five PNG plots are written to:
 
     artifacts/graphs/
         step_XXXXXXX_loss.png           train + val loss curves
         step_XXXXXXX_perplexity.png     train + val perplexity curves
         step_XXXXXXX_lr.png             learning-rate schedule
         step_XXXXXXX_tokens_per_sec.png throughput over time
+        step_XXXXXXX_tokens_seen.png    cumulative tokens seen
         latest_loss.png                 always overwritten (watch live)
         latest_perplexity.png
+        latest_tokens_seen.png
 
 Raw numbers are persisted as:
     artifacts/graphs/metrics.json
@@ -66,7 +68,7 @@ def get_args():
     p.add_argument("--weight_decay",   type=float, default=0.1)
     p.add_argument("--val_interval",   type=int,   default=100)
     p.add_argument("--val_steps",      type=int,   default=50)
-    p.add_argument("--save_interval",  type=int,   default=100)
+    p.add_argument("--save_interval",  type=int,   default=1000)
     p.add_argument("--ckpt_dir",       default="checkpoints")
     p.add_argument("--graph_dir",      default="artifacts/graphs")
     p.add_argument("--log_interval",   type=int,   default=10)
@@ -91,8 +93,6 @@ def get_args():
     return args
 
 
-
-
 # ── Metrics tracker ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -104,6 +104,7 @@ class MetricsTracker:
     val_steps   / val_losses   / val_ppl     — every val_interval
     lr_steps    / lrs                        — every log_interval
     tps_steps   / tokens_per_sec            — every log_interval
+    tokens_seen                              — cumulative tokens, every log_interval
     """
     train_steps:    List[int]   = field(default_factory=list)
     train_losses:   List[float] = field(default_factory=list)
@@ -115,8 +116,9 @@ class MetricsTracker:
     lrs:            List[float] = field(default_factory=list)
     tps_steps:      List[int]   = field(default_factory=list)
     tokens_per_sec: List[float] = field(default_factory=list)
+    tokens_seen:    List[int]   = field(default_factory=list)   # ← NEW
 
-    def record_train(self, step: int, loss: float, lr: float, tps: float):
+    def record_train(self, step: int, loss: float, lr: float, tps: float, tokens: int):
         self.train_steps.append(step)
         self.train_losses.append(loss)
         self.train_ppl.append(math.exp(min(loss, 20)))
@@ -124,6 +126,7 @@ class MetricsTracker:
         self.lrs.append(lr)
         self.tps_steps.append(step)
         self.tokens_per_sec.append(tps)
+        self.tokens_seen.append(tokens)                         # ← NEW
 
     def record_val(self, step: int, loss: float):
         self.val_steps.append(step)
@@ -147,7 +150,7 @@ class MetricsTracker:
 
 def plot_graphs(metrics: MetricsTracker, graph_dir: Path, step: int):
     """
-    Renders 4 dark-themed PNG charts and saves them as:
+    Renders 5 dark-themed PNG charts and saves them as:
         step_XXXXXXX_<name>.png   (permanent, one per checkpoint)
         latest_<name>.png         (always overwritten, easy to watch live)
     """
@@ -162,6 +165,7 @@ def plot_graphs(metrics: MetricsTracker, graph_dir: Path, step: int):
     VAL   = "#E8744C"
     LR_C  = "#6BBF59"
     TPS_C = "#B05CE8"
+    TOK_C = "#E8C84C"   # ← NEW colour for tokens-seen chart
     BG    = "#0F1117"
     GRID  = "#2A2D3A"
     TEXT  = "#E0E0E0"
@@ -230,6 +234,16 @@ def plot_graphs(metrics: MetricsTracker, graph_dir: Path, step: int):
         ticker.FuncFormatter(lambda x, _: f"{x/1000:.0f}k" if x >= 1000 else str(int(x))))
     save(fig, "tokens_per_sec")
 
+    # 5. Tokens seen  ← NEW
+    fig, ax = plt.subplots(figsize=(9, 3)); fig.patch.set_facecolor(BG)
+    if metrics.train_steps and metrics.tokens_seen:
+        ax.plot(metrics.train_steps, [t / 1e6 for t in metrics.tokens_seen],
+                color=TOK_C, lw=1.4, label="Tokens seen")
+    style(ax, f"Total Tokens Seen  (step {step:,})", "Step", "Tokens (M)")
+    ax.yaxis.set_major_formatter(
+        ticker.FuncFormatter(lambda x, _: f"{x:.0f}M"))
+    save(fig, "tokens_seen")
+
     print(f"  📊 Graphs → {graph_dir}/step_{step:07d}_*.png  +  latest_*.png")
 
 
@@ -284,7 +298,7 @@ def save_checkpoint(step, model, optimizer, val_loss, cfg,
     # Persist metrics JSON
     metrics.save_json(graph_dir / "metrics.json")
 
-    # Save all four graphs
+    # Save all five graphs
     plot_graphs(metrics, graph_dir, step)
 
 
@@ -357,7 +371,7 @@ def main():
     no_decay = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
     optimizer = torch.optim.AdamW(
         [{"params": decay, "weight_decay": args.weight_decay},
-         {"params": no_decay, "weight_decay": 0.0}],
+         {"params": no_decay, "weight_decay": 0.0}], 
         lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
 
     data_root    = Path(args.data_dir)
@@ -372,10 +386,17 @@ def main():
 
     start_step, best_val, metrics = load_latest(model, optimizer, ckpt_dir, device, graph_dir)
 
+    # Restore total tokens seen from the last checkpoint (handles resume correctly)
+    total_tokens: int = metrics.tokens_seen[-1] if metrics.tokens_seen else 0  # ← NEW
+    print(f"Tokens seen so far: {total_tokens:,}")                             # ← NEW
+
     model.train()
     train_iter   = iter(train_loader)
     t0           = time.time()
     running_loss = 0.0
+
+    # Tokens processed per optimiser step (grad_accum micro-batches × batch × seq)
+    tokens_per_step: int = args.grad_accum * args.batch_size * args.context_length  # ← NEW
 
     for step in range(start_step, args.max_steps):
 
@@ -406,19 +427,22 @@ def main():
         scaler.update()
         running_loss += accum_loss
 
+        total_tokens += tokens_per_step   # ← NEW: increment after every optimiser step
+
         # ── Log + record train metrics ────────────────────────────────────────
         if (step + 1) % args.log_interval == 0:
             elapsed  = time.time() - t0
-            tps      = (args.log_interval * args.grad_accum *
-                        args.batch_size * args.context_length / elapsed)
+            tps      = (args.log_interval * tokens_per_step / elapsed)  # ← uses same constant
             avg_loss = running_loss / args.log_interval
             ppl      = math.exp(min(avg_loss, 20))
 
             print(f"step {step+1:>7,}/{args.max_steps:,}  "
                   f"loss={avg_loss:.4f}  ppl={ppl:.1f}  "
-                  f"lr={lr:.2e}  tok/s={tps:,.0f}  {elapsed:.1f}s")
+                  f"lr={lr:.2e}  tok/s={tps:,.0f}  "
+                  f"tokens={total_tokens/1e6:.2f}M  "   # ← NEW in log line
+                  f"{elapsed:.1f}s")
 
-            metrics.record_train(step + 1, avg_loss, lr, tps)   # ← stored
+            metrics.record_train(step + 1, avg_loss, lr, tps, total_tokens)  # ← passes tokens
             running_loss = 0.0
             t0 = time.time()
 
@@ -429,7 +453,7 @@ def main():
             tag      = " ★ new best" if val_loss < best_val else ""
             print(f"  val_loss={val_loss:.4f}  val_ppl={val_ppl:.1f}{tag}")
 
-            metrics.record_val(step + 1, val_loss)               # ← stored
+            metrics.record_val(step + 1, val_loss)
 
             if val_loss < best_val:
                 best_val = val_loss
@@ -451,7 +475,8 @@ def main():
     save_checkpoint(args.max_steps, model, optimizer, val_loss,
                     cfg, ckpt_dir, metrics, graph_dir)
     print(f"\n✓  Done.  val_loss={val_loss:.4f}  "
-          f"val_ppl={math.exp(min(val_loss,20)):.1f}")
+          f"val_ppl={math.exp(min(val_loss,20)):.1f}  "
+          f"total_tokens={total_tokens/1e6:.2f}M")   # ← NEW in final summary
     print(f"   All graphs in {graph_dir.resolve()}/")
 
 
